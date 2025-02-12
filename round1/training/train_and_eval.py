@@ -7,30 +7,46 @@ from tqdm.auto import tqdm
 
 from round1.training.dataloader import MABeDataSplitter
 from round1.training.trainer import MABeSingleTaskTrainer
+import ray
+from tqdm import tqdm
 
-
-def train_multiple_tasks(data_splitter, seed, task_id_list, Constants, test_size, alpha_vals):
-    start = time.time()
+@ray.remote(num_cpus=8)
+def train_single_task(data_splitter, seed, task_id, Constants, test_size, alpha):
     
     trainer = MABeSingleTaskTrainer(data_splitter=data_splitter)
     trainer.split_data(seed=seed, split_keys=['SubmissionTrain'], test_size=test_size)
+    trainer.data_splitter.load_labels(task_id=task_id)
+    trainer.setup_logging(log_path=Constants.LOG_PATH, train_prefix=f'alpha-{alpha}-')
+    trainer.setup_neural_net(alpha=alpha)
+    trainer.train()
+    return {f'{task_id}-alpha-{alpha}' :trainer.model_path}
     
-    print(f'Seed {seed}: Train data split time', time.time() - start)
+def train_multiple_tasks(data_splitter, seed, task_id_list, Constants, test_size, alpha_vals):
     start = time.time()
     
-    model_paths = {}
-    for task_id in tqdm(task_id_list):
+    # Create a reference to the data splitter that can be shared across tasks
+    data_splitter_ref = ray.put(data_splitter)
+    constants_ref = ray.put(Constants)
+    
+    results = []
+    for task_id in task_id_list:
         for alpha in alpha_vals:
-            trainer.data_splitter.load_labels(task_id=task_id)
-
-            trainer.setup_logging(log_path=Constants.LOG_PATH, train_prefix=f'alpha-{alpha}-')
-            trainer.setup_neural_net(alpha=alpha)
-            trainer.train()
-            model_paths[task_id + '-alpha-' + str(alpha)] = trainer.model_path
-
+            results.append(train_single_task.remote(data_splitter_ref, seed, task_id, constants_ref, test_size, alpha))
+            
+    # Create a progress bar for tracking
+    pbar = tqdm(total=len(results), desc="Training tasks")
+    
+    # Collect results as they complete
+    model_paths = {}
+    while results:
+        done_id, results = ray.wait(results)
+        result = ray.get(done_id[0])
+        model_paths.update(result)
+        pbar.update(1)
+    
+    pbar.close()
     print(f'Seed {seed}: All tasks train time', time.time() - start)
-    start = time.time()
-
+    
     return model_paths
 
 def predict_single_task_multiseed(data_splitter, task_id, model_paths, Constants, split_keys):
@@ -57,7 +73,8 @@ def predict_single_task_multiseed(data_splitter, task_id, model_paths, Constants
 
     return all_y_preds, agg_fn, metrics_fn, y_true, metric_name
 
-def eval_single_task_multiseed(data_splitter, task_id, model_paths, Constants, task_is_sequence_level):
+@ray.remote(num_cpus=4)
+def eval_single_task_multiseed(data_splitter, task_id, alpha, model_paths, Constants, task_is_sequence_level):
 
     def rem_nan_idx(y):
         y_notnan_idx = ~np.isnan(y)
@@ -123,8 +140,7 @@ def eval_single_task_multiseed(data_splitter, task_id, model_paths, Constants, t
     else:
         pooled_score = -1
 
-    return private_score, public_score,  metric_name, no_ensemble_score, pooled_score, task_is_sequence_level
-
+    return {f'alpha_{alpha}_taskid_{task_id}': [private_score, public_score,  metric_name, no_ensemble_score, pooled_score, task_is_sequence_level]}
 
 def run_all_tasks(Constants, test_size):
     with open(Constants.SPLIT_INFO_FILE, 'r') as fp:
@@ -141,8 +157,7 @@ def run_all_tasks(Constants, test_size):
         seeds = [42, 43]
         task_id_list = task_id_list[1:3]
         alpha_vals = [0.1, 1.0]
-
-
+   
     start = time.time()
     data_splitter = MABeDataSplitter(submission_data_path=Constants.SUBMISSION_DATA_PATH,              
                                      split_info=split_info,
@@ -154,8 +169,12 @@ def run_all_tasks(Constants, test_size):
     for seed in seeds:
         model_paths_all[seed] = train_multiple_tasks(data_splitter, seed, task_id_list, Constants, test_size, alpha_vals)
 
+    ray.put(model_paths_all)
+    ray.put(data_splitter)
+    
     results = []
     model_paths = {}
+    future_results = []
     for task_id in task_id_list:
         alpha_scores = []
         for alpha in alpha_vals:
@@ -164,16 +183,30 @@ def run_all_tasks(Constants, test_size):
                 model_paths[alpha].append(model_paths_all[seed][task_id + '-alpha-' + str(alpha)])
         
             task_is_sequence_level = task_id in sequence_level_tasks
-            res = eval_single_task_multiseed(data_splitter, task_id, model_paths[alpha], Constants, task_is_sequence_level)
-            alpha_scores.append(res[0].copy())
+            future_results.append(eval_single_task_multiseed.remote(data_splitter, task_id, alpha, model_paths[alpha], Constants, task_is_sequence_level))
+            
+            
+    pbar = tqdm(total=len(future_results), desc="Evaluating tasks")
+    all_results = {}
+    while future_results:
+        done_id, future_results = ray.wait(future_results)
+        res = ray.get(done_id[0])
+        all_results.update(res)
+        pbar.update(1)
+    
+    pbar.close()   
+    results = []
+    for task_id in task_id_list:
+        alpha_scores = []
+        for alpha in alpha_vals:
+            alpha_scores.append(all_results[f'alpha_{alpha}_taskid_{task_id}'][0].copy())
             if alpha == 1.0:
-                private_score, public_score, metric_name, no_ensemble_score, pooled_score, task_is_sequence_level = res
+                private_score, public_score, metric_name, no_ensemble_score, pooled_score, task_is_sequence_level = all_results[f'alpha_{alpha}_taskid_{task_id}']
                 task_results = [task_id, private_score, public_score, metric_name, no_ensemble_score, pooled_score, task_is_sequence_level]
-
         print("Results: Task", task_id, "| Metric", metric_name, "| Public", public_score, "| Private", private_score, '\n')
         task_results.extend(alpha_scores)
         results.append(task_results)
-    
+   
     columns=['Task ID', 'Private Score', 'Public Score', 'Metric', 
              'No Ensemble Score', 'Pooled Score', 'Sequence Level Task']
     for alpha in alpha_vals:
@@ -181,8 +214,8 @@ def run_all_tasks(Constants, test_size):
     
     results_df = pd.DataFrame(results, columns=columns)
     results_df.to_csv(os.path.join(Constants.LOG_PATH, 'results.csv'), index=False)
-
-
+    
+    
 if __name__ == '__main__':
     class Constants:
         SUBMISSION_DATA_PATH = os.getenv('SUBMISSION_DATA_PATH', './example_data/example_embeddings.npy')
