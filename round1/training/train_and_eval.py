@@ -199,7 +199,7 @@ def run_all_tasks(Constants, test_size):
     for task_id in task_id_list:
         alpha_scores = []
         for alpha in alpha_vals:
-            alpha_scores.append(all_results[f'alpha_{alpha}_taskid_{task_id}'][0].copy())
+            alpha_scores.append(all_results[f'alpha_{alpha}_taskid_{task_id}'][0])
             if alpha == 1.0:
                 private_score, public_score, metric_name, no_ensemble_score, pooled_score, task_is_sequence_level = all_results[f'alpha_{alpha}_taskid_{task_id}']
                 task_results = [task_id, private_score, public_score, metric_name, no_ensemble_score, pooled_score, task_is_sequence_level]
